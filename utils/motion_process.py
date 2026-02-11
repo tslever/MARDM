@@ -111,12 +111,12 @@ def plot_3d_motion(save_path, kinematic_tree, joints, title, figsize=(10, 10), f
         title = '\n'.join([' '.join(title_sp[:10]), ' '.join(title_sp[10:])])
 
     def init():
-        #ax.set_xlim3d([-radius / 2, radius / 2])
-        #ax.set_ylim3d([0, radius])
-        #ax.set_zlim3d([0, radius])
-        ax.set_xlim3d([-5, 5])
-        ax.set_ylim3d([0, 10])
-        ax.set_zlim3d([-5, 5])
+        ax.set_xlim3d([-radius / 2, radius / 2])
+        ax.set_ylim3d([0, radius])
+        ax.set_zlim3d([0, radius])
+        #ax.set_xlim3d([-5, 5])
+        #ax.set_ylim3d([0, 10])
+        #ax.set_zlim3d([-5, 5])
         fig.suptitle(title, fontsize=20)
         ax.grid(b=False)
 
