@@ -121,4 +121,5 @@ dmypy.json
 .idea
 
 checkpoints
+datasets
 glove
