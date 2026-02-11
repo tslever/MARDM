@@ -121,6 +121,13 @@ def main(args):
             os.makedirs(s_path, exist_ok=True)
             joint_data = joint_data[:m_length[k]]
             joint = recover_from_ric(torch.from_numpy(joint_data).float(), nb_joints).numpy()
+            print(
+                "joint stats:",
+                "min", np.nanmin(joint),
+                "max", np.nanmax(joint),
+                "nan?", np.isnan(joint).any(),
+                "inf?", np.isinf(joint).any()
+            )
             save_path = pjoin(s_path, "caption:%s_sample%d_repeat%d_len%d.mp4" % (caption, k, r, m_length[k]))
             plot_3d_motion(save_path, kinematic_chain, joint, title=caption, fps=20)
             np.save(pjoin(s_path, "caption:%s_sample%d_repeat%d_len%d.npy" % (caption, k, r, m_length[k])), joint)
