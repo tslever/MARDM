@@ -122,5 +122,7 @@ dmypy.json
 
 checkpoints
 datasets
+descriptions
 generation
 glove
+texts
