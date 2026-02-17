@@ -170,7 +170,6 @@ def main(args):
     else:
         token_lens_all = (torch.LongTensor(length_list) // 4).to(device).long()
     
-    token_lens_all = token_lens_all.to(device).long()
     m_length_all = token_lens_all * 4
     captions = prompt_list
 
@@ -178,7 +177,7 @@ def main(args):
     kinematic_chain = kit_kinematic_chain if args.dataset_name == 'kit' else t2m_kinematic_chain
 
     def prompt_done(group: str, idx: int) -> bool:
-        s_path = Path(result_dir) / str(idx)
+        s_path = Path(result_dir) / group / str(idx)
         if not s_path.exists():
             return False
         return (len(list(s_path.glob("*.mp4"))) > 0) or (len(list(s_path.glob("*.npy"))) > 0)
