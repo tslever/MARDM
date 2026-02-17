@@ -11,6 +11,34 @@ from models.LengthEstimator import LengthEstimator
 from utils.motion_process import recover_from_ric, plot_3d_motion, kit_kinematic_chain, t2m_kinematic_chain
 import argparse
 
+import glob
+from pathlib import Path
+
+
+import re
+
+def safe_stem(s: str, max_len: int = 120) -> str:
+    # Replace path separators explicitly (Linux/macOS: '/', Windows: '\')
+    s = s.replace("/", "_").replace("\\", "_")
+
+    # Replace anything not filename-friendly with underscores
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+
+    # Collapse runs of underscores and trim
+    s = re.sub(r"_+", "_", s).strip("._-")
+
+    # Avoid overly long filenames (common filesystem limit is 255 bytes)
+    if len(s) > max_len:
+        s = s[:max_len].rstrip("._-")
+
+    return s or "caption"
+
+
+def chunked(xs: list[int], n: int):
+    for i in range(0, len(xs), n):
+        yield xs[i:i + n]
+
+
 def main(args):
     #################################################################################
     #                                      Seed                                     #
@@ -93,44 +121,87 @@ def main(args):
 
     if est_length:
         print("Since no motion length are specified, we will use estimated motion lengthes!!")
-        text_embedding = ema_mardm.encode_text(prompt_list)
-        pred_dis = length_estimator(text_embedding)
-        probs = F.softmax(pred_dis, dim=-1)
-        token_lens = Categorical(probs).sample()
+        with torch.no_grad():
+            text_embedding = ema_mardm.encode_text(prompt_list)
+            pred_dis = length_estimator(text_embedding)
+            probs = F.softmax(pred_dis, dim=-1)
+            token_lens_all = Categorical(probs).sample()
     else:
-        token_lens = torch.LongTensor(length_list) // 4
-        token_lens = token_lens.to(device).long()
-    m_length = token_lens * 4
+        token_lens_all = torch.LongTensor(length_list) // 4
+    
+    token_lens_all = token_lens_all.to(device).long()
+    m_length_all = token_lens_all * 4
     captions = prompt_list
 
     sample = 0
     kinematic_chain = kit_kinematic_chain if args.dataset_name == 'kit' else t2m_kinematic_chain
 
+    def is_done(idx: int) -> bool:
+        s_path = Path(result_dir) / str(idx)
+        if not s_path.exists():
+            return False
+        return (len(list(s_path.glob("*.mp4"))) > 0) or (len(list(s_path.glob("*.npy"))) > 0)
+
+    pending_indices = [i for i in range(len(prompt_list)) if not is_done(i)]
+    if not pending_indices:
+        print(f"All {len(prompt_list)} prompts already have outputs under {result_dir}. Nothing to do.")
+        return
+    
+    captions = [prompt_list[i] for i in pending_indices]
+    token_lens = token_lens_all[pending_indices]
+    m_length = m_length_all[pending_indices]
+
+    print(f"Found {len(prompt_list) - len(pending_indices)} completed; generating {len(pending_indices)} prompts:")
+    print(f"First few pending indices: {pending_indices[:10]}")
+
+    batch_size = 8
+    batch_id_global = 0
+
     for r in range(args.repeat_times):
         print("-->Repeat %d" % r)
-        with torch.no_grad():
-            pred_latents = ema_mardm.generate(captions, token_lens, args.time_steps, args.cfg,
-                                              temperature=args.temperature, hard_pseudo_reorder=args.hard_pseudo_reorder)
-            pred_motions = ae.decode(pred_latents)
-            pred_motions = pred_motions.detach().cpu().numpy()
-            data = pred_motions * std + mean
 
-        for k, (caption, joint_data) in enumerate(zip(captions, data)):
-            print("---->Sample %d: %s %d" % (k, caption, m_length[k]))
-            s_path = pjoin(result_dir, str(k))
-            os.makedirs(s_path, exist_ok=True)
-            joint_data = joint_data[:m_length[k]]
-            joint = recover_from_ric(torch.from_numpy(joint_data).float(), nb_joints).numpy()
-            print(
-                "joint stats:",
-                "min", np.nanmin(joint),
-                "max", np.nanmax(joint),
-                "nan?", np.isnan(joint).any(),
-                "inf?", np.isinf(joint).any()
-            )
-            save_path = pjoin(s_path, "caption:%s_sample%d_repeat%d_len%d.mp4" % (caption, k, r, m_length[k]))
-            plot_3d_motion(save_path, kinematic_chain, joint, title=caption, fps=20)
-            np.save(pjoin(s_path, "caption:%s_sample%d_repeat%d_len%d.npy" % (caption, k, r, m_length[k])), joint)
+        for batch_indices in chunked(pending_indices, batch_size):
+            batch_id_global += 1
+            print(f"  -> Batch {batch_id_global} (size={len(batch_indices)}): {batch_indices[:10]}")
+
+            batch_captions = [prompt_list[i] for i in batch_indices]
+            batch_token_lens = token_lens_all[batch_indices]
+            batch_m_length = m_length_all[batch_indices]
+
+            with torch.no_grad():
+                pred_latents = ema_mardm.generate(
+                    batch_captions,
+                    batch_token_lens,
+                    args.time_steps,
+                    args.cfg,
+                    temperature = args.temperature,
+                    hard_pseudo_reorder = args.hard_pseudo_reorder
+                )
+                pred_motions = ae.decode(pred_latents)
+                pred_motions = pred_motions.detach().cpu().numpy()
+                data = pred_motions * std + mean
+
+            for local_i, (orig_idx, caption, joint_data) in enumerate(zip(batch_indices, batch_captions, data)):
+                ml = int(batch_m_length[local_i])
+                print(f"    ----> Prompt index {orig_idx}: {caption}  len={ml}")
+                s_path = pjoin(result_dir, str(orig_idx))
+                os.makedirs(s_path, exist_ok=True)
+                joint_data = joint_data[:ml]
+                joint = recover_from_ric(torch.from_numpy(joint_data).float(), nb_joints).numpy()
+                print(
+                    "    joint stats:",
+                    "min", np.nanmin(joint),
+                    "max", np.nanmax(joint),
+                    "nan?", np.isnan(joint).any(),
+                    "inf?", np.isinf(joint).any()
+                )
+                cap_stem = safe_stem(caption)
+                mp4_name = f"{cap_stem}_sample{orig_idx}_repeat{r}_len{ml}.mp4"
+                npy_name = f"{cap_stem}_sample{orig_idx}_repeat{r}_len{ml}.npy"
+                save_mp4 = pjoin(s_path, mp4_name)
+                save_npy = pjoin(s_path, npy_name)
+                plot_3d_motion(save_mp4, kinematic_chain, joint, title=caption, fps=20)
+                np.save(save_npy, joint)
 
 
 if __name__ == "__main__":
