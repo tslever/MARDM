@@ -39,6 +39,28 @@ def chunked(xs: list[int], n: int):
         yield xs[i:i + n]
 
 
+def load_descriptions_dir(desc_dir: Path):
+    """
+    Reads ./descriptions/*.txt.
+    Returns:
+      prompt_list: list[str] of ALL descriptions across all files (in file order, then line order)
+      group_of_prompt: list[str] same length as prompt_list; folder name per prompt (base name of file)
+    """
+    prompt_list: list[str] = []
+    group_of_prompt: list[str] = []
+
+    for fpath in sorted(desc_dir.glob("*.txt")):
+        group = fpath.stem  # base name (e.g., M000123)
+        for line in fpath.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            prompt_list.append(line)
+            group_of_prompt.append(group)
+
+    return prompt_list, group_of_prompt
+
+
 def main(args):
     #################################################################################
     #                                      Seed                                     #
@@ -88,11 +110,20 @@ def main(args):
     #                                     Sampling                                  #
     #################################################################################
     prompt_list = []
+    group_of_prompt = []
     length_list = []
 
     est_length = False
-    if args.text_prompt != "":
+
+    if args.descriptions:
+        desc_dir = Path(args.descriptions_dir)
+        prompt_list, group_of_prompt = load_descriptions_dir(desc_dir)
+        if len(prompt_list) == 0:
+            raise RuntimeError(f"No descriptions found under {desc_dir}/*.txt")
+        est_length = True
+    elif args.text_prompt != "":
         prompt_list.append(args.text_prompt)
+        group_of_prompt.append("single")
         if args.motion_length == 0:
             est_length = True
         else:
@@ -103,13 +134,14 @@ def main(args):
             for line in lines:
                 infos = line.split('#')
                 prompt_list.append(infos[0])
+                group_of_prompt.append("text_path")
                 if len(infos) == 1 or (not infos[1].isdigit()):
                     est_length = True
                     length_list = []
                 else:
                     length_list.append(int(infos[-1]))
     else:
-        raise "A text prompt, or a file a text prompts are required!!!"
+        raise Exception("A text prompt, a file of text prompts, or --descriptions is required.")
 
     ae.to(device)
     ema_mardm.to(device)
@@ -121,13 +153,22 @@ def main(args):
 
     if est_length:
         print("Since no motion length are specified, we will use estimated motion lengthes!!")
+        all_token_lens = []
+        text_bs = args.text_batch_size
         with torch.no_grad():
-            text_embedding = ema_mardm.encode_text(prompt_list)
-            pred_dis = length_estimator(text_embedding)
-            probs = F.softmax(pred_dis, dim=-1)
-            token_lens_all = Categorical(probs).sample()
+            for start in range(0, len(prompt_list), text_bs):
+                batch_prompts = prompt_list[start:start + text_bs]
+                text_embedding = ema_mardm.encode_text(batch_prompts)
+                pred_dis = length_estimator(text_embedding)
+                probs = F.softmax(pred_dis, dim=-1)
+                token_lens = Categorical(probs).sample()
+                all_token_lens.append(token_lens.detach().cpu())
+                del text_embedding, pred_dis, probs, token_lens
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+        token_lens_all = torch.cat(all_token_lens, dim = 0).to(device).long()
     else:
-        token_lens_all = torch.LongTensor(length_list) // 4
+        token_lens_all = (torch.LongTensor(length_list) // 4).to(device).long()
     
     token_lens_all = token_lens_all.to(device).long()
     m_length_all = token_lens_all * 4
@@ -136,13 +177,13 @@ def main(args):
     sample = 0
     kinematic_chain = kit_kinematic_chain if args.dataset_name == 'kit' else t2m_kinematic_chain
 
-    def is_done(idx: int) -> bool:
+    def prompt_done(group: str, idx: int) -> bool:
         s_path = Path(result_dir) / str(idx)
         if not s_path.exists():
             return False
         return (len(list(s_path.glob("*.mp4"))) > 0) or (len(list(s_path.glob("*.npy"))) > 0)
 
-    pending_indices = [i for i in range(len(prompt_list)) if not is_done(i)]
+    pending_indices = [i for i in range(len(prompt_list)) if not prompt_done(group_of_prompt[i], i)]
     if not pending_indices:
         print(f"All {len(prompt_list)} prompts already have outputs under {result_dir}. Nothing to do.")
         return
@@ -154,13 +195,12 @@ def main(args):
     print(f"Found {len(prompt_list) - len(pending_indices)} completed; generating {len(pending_indices)} prompts:")
     print(f"First few pending indices: {pending_indices[:10]}")
 
-    batch_size = 8
     batch_id_global = 0
 
     for r in range(args.repeat_times):
         print("-->Repeat %d" % r)
 
-        for batch_indices in chunked(pending_indices, batch_size):
+        for batch_indices in chunked(pending_indices, args.batch_size):
             batch_id_global += 1
             print(f"  -> Batch {batch_id_global} (size={len(batch_indices)}): {batch_indices[:10]}")
 
@@ -182,9 +222,10 @@ def main(args):
                 data = pred_motions * std + mean
 
             for local_i, (orig_idx, caption, joint_data) in enumerate(zip(batch_indices, batch_captions, data)):
+                group = group_of_prompt[orig_idx]
                 ml = int(batch_m_length[local_i])
-                print(f"    ----> Prompt index {orig_idx}: {caption}  len={ml}")
-                s_path = pjoin(result_dir, str(orig_idx))
+                print(f"    ----> {group}/{orig_idx}: {caption}  len={ml}")
+                s_path = pjoin(result_dir, group, str(orig_idx))
                 os.makedirs(s_path, exist_ok=True)
                 joint_data = joint_data[:ml]
                 joint = recover_from_ric(torch.from_numpy(joint_data).float(), nb_joints).numpy()
@@ -206,6 +247,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type = int, default = 8)
+    parser.add_argument("--text_batch_size", type = int, default = 64, help = "Batch size for CLIP text encoding / length estimation (lower if OOM).")
     parser.add_argument('--name', type=str, default='MARDM')
     parser.add_argument('--ae_name', type=str, default="AE")
     parser.add_argument('--ae_model', type=str, default='AE_Model')
@@ -222,6 +265,8 @@ if __name__ == "__main__":
     parser.add_argument('--text_prompt', default='', type=str)
     parser.add_argument('--text_path', type=str, default="")
     parser.add_argument("--motion_length", default=0, type=int)
+    parser.add_argument("--descriptions", action="store_true", help="If set, read prompts from descriptions_dir/*.txt; one prompt per line.")
+    parser.add_argument("--descriptions_dir", type=str, default="descriptions", help="Directory containing *.txt files of descriptions (one per line).")
     parser.add_argument("--repeat_times", default=1, type=int)
     parser.add_argument('--hard_pseudo_reorder', action="store_true")
     arg = parser.parse_args()
