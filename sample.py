@@ -14,8 +14,25 @@ import argparse
 import glob
 from pathlib import Path
 
-
 import re
+
+
+def indices_from_batch(shard_index: int, n: int, shard_size: int):
+    if shard_index is None or shard_index < 0:
+        return set()
+    lo = shard_index * shard_size
+    hi = min((shard_index + 1) * shard_size - 1, n - 1)
+    if lo <= hi:
+        return set(range(lo, hi + 1))
+    return set()
+
+
+def apply_index_filter(pending, n_total: int, shard_size: int, shard_index):
+    if shard_index is None or shard_size is None:
+        return pending
+    inc_set = indices_from_batch(shard_index, n_total, shard_size)
+    return [i for i in pending if i in inc_set]
+
 
 def safe_stem(s: str, max_len: int = 120) -> str:
     # Replace path separators explicitly (Linux/macOS: '/', Windows: '\')
@@ -186,12 +203,32 @@ def main(args):
     if not pending_indices:
         print(f"All {len(prompt_list)} prompts already have outputs under {result_dir}. Nothing to do.")
         return
-    
-    captions = [prompt_list[i] for i in pending_indices]
-    token_lens = token_lens_all[pending_indices]
-    m_length = m_length_all[pending_indices]
 
-    print(f"Found {len(prompt_list) - len(pending_indices)} completed; generating {len(pending_indices)} prompts:")
+    completed_count = len(prompt_list) - len(pending_indices)
+
+    pending_indices = apply_index_filter(
+        pending=pending_indices,
+        n_total=len(prompt_list),
+        shard_size=args.shard_size,
+        shard_index=args.shard_index
+    )
+
+    if args.shard_index is not None:
+        print(
+            f"Index filter applied (shard_index={args.shard_index}). "
+            f"Now considering {len(pending_indices)} pending prompts out of {len(prompt_list)} total."
+        )
+
+    if not pending_indices:
+        if args.shard_index is not None and args.shard_size is not None:
+            lo = args.shard_index * args.shard_size
+            hi = min((args.shard_index + 1) * args.shard_size - 1, len(prompt_list) - 1)
+            print(f"No pending prompts in selected shard {args.shard_index} (global indices {lo}-{hi}). Nothing to do.")
+        else:
+            print("No pending prompts. Nothing to do.")
+        return
+
+    print(f"Found {completed_count} completed; generating {len(pending_indices)} prompts:")
     print(f"First few pending indices: {pending_indices[:10]}")
 
     batch_id_global = 0
@@ -208,14 +245,18 @@ def main(args):
             batch_m_length = m_length_all[batch_indices]
 
             with torch.no_grad():
-                pred_latents = ema_mardm.generate(
-                    batch_captions,
-                    batch_token_lens,
-                    args.time_steps,
-                    args.cfg,
-                    temperature = args.temperature,
-                    hard_pseudo_reorder = args.hard_pseudo_reorder
-                )
+                try:
+                    pred_latents = ema_mardm.generate(
+                        batch_captions,
+                        batch_token_lens,
+                        args.time_steps,
+                        args.cfg,
+                        temperature = args.temperature,
+                        hard_pseudo_reorder = args.hard_pseudo_reorder
+                    )
+                except AssertionError as e:
+                    print(f"ODEINT failed for batch starting with {batch_indices[:3]}: {e}")
+                    continue
                 pred_motions = ae.decode(pred_latents)
                 pred_motions = pred_motions.detach().cpu().numpy()
                 data = pred_motions * std + mean
@@ -268,5 +309,13 @@ if __name__ == "__main__":
     parser.add_argument("--descriptions_dir", type=str, default="descriptions", help="Directory containing *.txt files of descriptions (one per line).")
     parser.add_argument("--repeat_times", default=1, type=int)
     parser.add_argument('--hard_pseudo_reorder', action="store_true")
+
+    parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=None,
+        help="Single batch index to include (0-based). Batch k = [k*batch_size .. (k+1)*batch_size-1]."
+    )
+    parser.add_argument("--shard_size", type = int, default = None, help = "How many prompt indices each Slurm array task owns (e.g., 437). If None, no sharding is applied.")
     arg = parser.parse_args()
     main(arg)
